@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      # Each action is pinned to a commit, because a tag can be moved. The commits are checkout
+      # v4.2.2, setup-scarb v1.5.0 and setup-snfoundry v3. Scarb and Starknet Foundry are installed
+      # at the versions in .tool-versions.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: software-mansion/setup-scarb@22f50f68eb6ffacfc173786dab19aa7d49b43441
+      - uses: foundry-rs/setup-snfoundry@bd5fc266ba0ce7e352b01dd7eaacc0fbb6145d17
+      # Run the installer from the commit of the release it installs (v2.4.0), not from a branch
+      # that can change.
+      - name: Universal Sierra Compiler
+        run: curl -L https://raw.githubusercontent.com/software-mansion/universal-sierra-compiler/37f897e8a7f055e9dcf2dc5e182713df4c25f766/scripts/install.sh | sh -s -- v2.4.0
+      - run: scarb fmt --check
+      - run: python3 scripts/check-vectors.py
+      # The fork test is skipped here because it needs a Sepolia node.
+      - run: snforge test

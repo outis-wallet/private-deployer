@@ -1,0 +1,47 @@
+[package]
+name = "private_deployer"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "=2.13.1"
+license = "MIT"
+description = "Deploys contracts from Starknet's privacy pool through the Universal Deployer Contract"
+repository = "https://github.com/outis-wallet/private-deployer"
+
+[dependencies]
+starknet = "=2.13.1"
+# OpenZeppelin's function that computes a UDC deployment address
+# (`calculate_contract_address_from_udc`) and the UDC's interface. These are the last OpenZeppelin
+# releases that support Cairo 2.13.
+openzeppelin_interfaces = "=2.1.0"
+openzeppelin_utils = "=2.1.0"
+
+[dev-dependencies]
+snforge_std = "=0.51.2"
+assert_macros = "=2.13.1"
+# The source of the UDC. The tests deploy it at the UDC's real address.
+openzeppelin_presets = "=3.0.0"
+
+[[target.starknet-contract]]
+sierra = true
+casm = true
+# The tests declare the UDC class, so it has to be built with them. It is not part of this
+# contract. `scarb build` does not load dev-dependencies, so it warns that this class was not found.
+# That warning is expected.
+build-external-contracts = ["openzeppelin_presets::universal_deployer::UniversalDeployer"]
+
+[scripts]
+test = "snforge test"
+
+[tool.fmt]
+max-line-length = 160
+sort-module-level-items = true
+
+[tool.scarb]
+allow-prebuilt-plugins = ["snforge_std"]
+
+# The node for the fork test (`snforge test --ignored`). It must be a Sepolia node, because the
+# fork test uses the real UDC there.
+[[tool.snforge.fork]]
+name = "SEPOLIA"
+url = "http://127.0.0.1:9545/rpc/v0_9"
+block_id.tag = "latest"
