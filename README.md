@@ -7,7 +7,8 @@ Starknet already has the
 [Universal Deployer Contract](https://docs.openzeppelin.com/contracts-cairo/udc) (UDC), which
 deploys any declared class for whoever calls it. The privacy pool can't call the UDC directly. In a
 private action the pool can call one contract, and only that contract's `privacy_invoke` function.
-The Private Deployer has a `privacy_invoke` function that forwards the call to the UDC.
+The Private Deployer has a `privacy_invoke` function that forwards each deployment in the call to
+the UDC. One call can deploy a list of contracts.
 
 The deployment is then made by the pool's transaction and paid for from the pool. That is all
 "private" means here. The deployment itself is as public as any other.
@@ -37,10 +38,10 @@ A few things can still point to you:
 
 A deployment is one private action with two parts, in this order:
 
-1. **Withdrawals** to the new contract's address. Withdraw whatever the contract needs to hold. For
-   an account, that is the STRK it will pay fees with. The pool can withdraw to an address that
-   has no contract yet. Skip this part if the contract needs no funds.
-2. **An invoke** of the Private Deployer, with the calldata described below.
+1. **Withdrawals** to each new contract's address. Withdraw whatever the contract needs to hold.
+   For an account, that is the STRK it will pay fees with. The pool can withdraw to an address that
+   has no contract yet. Skip this part for a contract that needs no funds.
+2. **An invoke** of the Private Deployer, with the list of deployments described below.
 
 Two rules of the pool matter here:
 
@@ -48,41 +49,68 @@ Two rules of the pool matter here:
   action must also do something the pool records once, such as spending a note. Paying a relayer
   spends a note, so a relayed action already qualifies. Registering a viewing key for the first
   time also qualifies, but it publishes the address of the account that registers.
-- **An action can contain only one invoke.** The deployment uses it. If the new contract needs
-  another call afterwards, that is a separate action. See "Which classes are safe" for why that
-  matters.
+- **An action can contain only one invoke.** The deployment uses it, however many contracts it
+  deploys. The action itself can't make another call afterwards. Constructors can still call other
+  contracts while they run, including contracts deployed earlier in the same list. See "Which
+  classes are safe" and "Deploying several contracts at once" for why that matters.
 
 ### The call
 
 ```
-privacy_invoke(class_hash, salt, not_from_zero, calldata, expected)
+privacy_invoke(deployments)
 ```
 
-| Argument | Meaning |
+`deployments` is a list of one or more deployments. Each deployment has five fields:
+
+| Field | Meaning |
 |---|---|
 | `class_hash` | The class to deploy. It must already be declared. |
 | `salt` | The salt. |
-| `not_from_zero` | `false` to deploy from zero, `true` otherwise. See "How it differs from the UDC". |
+| `not_from_zero` | `false` to deploy from zero, `true` otherwise. As a felt it must be 0 or 1. See "How it differs from the UDC". |
 | `calldata` | The constructor calldata, as a span: its length, then its felts. |
 | `expected` | The address where the contract must end up. |
 
-The first four arguments are the UDC's `deploy_contract` arguments, in the same order. `expected`
-is added.
+The first four fields are the UDC's `deploy_contract` arguments, in the same order. `expected` is
+added.
+
+As raw felts, the way the pool passes them, the calldata is the number of deployments, then each
+deployment's fields in the order above. For one deployment of a class with no constructor
+arguments, that is `1, class_hash, salt, not_from_zero, 0, expected`. A list has exactly one
+encoding, so a wallet can write the felts again from the list it shows and compare them with what
+it was asked to prove.
 
 ### What the call does
 
-- **It checks `expected` first.** If these arguments would not deploy to `expected`, the call fails
-  with `deployer/unexpected-address`. A wallet shows the user an address and withdraws to it, and
-  this check makes sure the contract is deployed at that same address. To get the address, call
-  `deployment_address(class_hash, salt, not_from_zero, calldata)` on the Private Deployer.
+First it checks every deployment in the list, before it deploys anything:
+
+- **It checks `expected`.** If the deployment's arguments would not deploy to its `expected`
+  address, the call fails with `deployer/unexpected-address`. A wallet shows the user an address
+  and withdraws to it, and this check makes sure the contract is deployed at that same address. To
+  get the address, call `deployment_address(class_hash, salt, not_from_zero, calldata)` on the
+  Private Deployer.
 - **It refuses an address that already has a contract.** The call fails with
   `deployer/already-deployed`. The UDC refuses this case too. A contract that is already there was
   constructed in someone else's transaction, before your withdrawals arrived.
-- **If the constructor fails, the call fails.**
-- **If the call fails, the whole action fails.** The withdrawals are undone and nothing leaves the
-  pool.
-- **If the call succeeds, the constructor ran inside your action.** The UDC called it, and it ran
-  after the action's withdrawals, because the pool makes withdrawals before the invoke.
+
+Because these checks come first, a wrong or taken address is refused before any constructor runs,
+wherever it is in the list. A transaction that reverts is still charged for the work it did, so
+this keeps a refused list cheap for whoever sent it.
+
+Then it deploys the contracts in the order of the list. For each one:
+
+- **It checks again that the address is empty.** An earlier constructor in the same list can
+  deploy anywhere, and so can the same deployment earlier in the list. Either way the call fails
+  with `deployer/already-deployed`.
+- **If the constructor fails, the call fails.** So does a deployment the UDC refuses for its own
+  reasons: a class that isn't declared, or constructor calldata over 294 felts.
+
+And for the call as a whole:
+
+- **An empty list is refused** with `deployer/no-deployments`.
+- **If one deployment fails, the whole call fails,** and nothing in the list is deployed. So does
+  the whole action: the withdrawals are undone and nothing leaves the pool.
+- **If the call succeeds, every constructor ran inside your action.** The UDC called each one, and
+  they ran after the action's withdrawals, because the pool makes withdrawals before the invoke.
 - **It returns no deposits.** The pool screens nothing and credits nothing.
 
 An account deployed this way starts at nonce 0. An account that deploys itself starts at nonce 1,
@@ -92,6 +120,26 @@ and not assume it.
 Anyone can also call `privacy_invoke` directly, without the pool. That is an ordinary UDC
 deployment with one extra step, and it hides nothing.
 
+### Deploying several contracts at once
+
+The pool takes its fee once per transaction, however many steps the action has. So a list deploys
+several contracts for one pool fee. Before you put contracts in one list, consider these points:
+
+- **Everything in one list is publicly tied together.** The deployments are in one transaction, so
+  anyone can see they were made by the same sender. That is fine for contracts that belong
+  together, or for accounts made for different people, such as a game's players. It is wrong for
+  accounts that one person wants kept apart. Deploy those in separate actions.
+- **One taken address refuses the whole list.** Someone who deploys one of your addresses first
+  blocks all of them with one deployment of their own. See "If someone deploys the address first".
+- **Constructors run one after another, in one transaction.** A later constructor sees what the
+  earlier ones did, and an earlier contract already exists, funded, when a later constructor runs.
+  Only classes whose constructors use their calldata alone are independent of the rest of the
+  list. See "Which classes are safe".
+- **The network's fee grows with the list.** Each deployment and each constructor costs gas. Only
+  the pool's fee is shared.
+- **The list has to fit in one transaction and one proof.** The 294-felt limit on constructor
+  calldata (see "Which classes are safe") applies to each deployment, not to the list.
+
 ### If someone deploys the address first
 
 The arguments of your action become public when it is sent. Whoever proves or relays the action
@@ -100,24 +148,28 @@ sees them even earlier. Anyone who knows the arguments can deploy the same addre
 - For a from-zero address, they can use the UDC or a contract of their own.
 - For a `not_from_zero` address, they can call the Private Deployer directly.
 
-Your action is then refused and your funds stay in the pool. It costs the other party one
-deployment. What it costs you depends on timing:
+Your action is then refused and your funds stay in the pool. If your action deploys a list, the
+whole list is refused. It costs the other party one deployment. What it costs you depends on timing:
 
 - If the address is taken before your transaction's fee is estimated, the estimate fails and
   nothing is sent.
 - If their deployment lands between the estimate and the block, your transaction reverts. Whoever
   sent it, usually the relayer, pays its fee.
 
-**Wallets should check that the address is free before proving.** The wallet's simulation and the
-proof only assemble the action's steps. They never call the Private Deployer. So a taken address
-does not show up in the simulation. It first shows up as `deployer/already-deployed` when the
-transaction that carries the proof is estimated.
+**Wallets should check that every address in the list is free before proving.** The wallet's
+simulation and the proof only assemble the action's steps. They never call the Private Deployer.
+So a taken address does not show up in the simulation. It first shows up as
+`deployer/already-deployed` when the transaction that carries the proof is estimated.
 
-What to do after a refusal depends on the class:
+What to do after a refusal depends on the class of the contract at the taken address:
 
 - If the constructor uses only its calldata, as an account's does, the contract that is now at the
   address is the one you wanted. Send it its funds with a plain withdrawal.
 - For any other class, deploy again with a different salt.
+
+If the refused action deployed a list, nothing else in it was deployed either. Send the list again
+without the taken entry, or with a new salt for it. Someone can take one address of each new list,
+so a wallet should be ready to drop entries or change salts more than once.
 
 ## Which classes are safe
 
@@ -127,6 +179,10 @@ class.
 - **The constructor must finish the setup.** Some classes need a second call after deployment, such
   as `initialize` or a call that claims ownership. The address is public, and the pool gives your
   second call no priority, so anyone can make that call before you.
+- **A constructor sees the chain as it is in the middle of the transaction.** If it reads other
+  contracts, such as a registry or a price, it reads them after the earlier constructors of the
+  same list ran, and any of those can call them. If a value matters, put the value you expect in
+  the calldata and have the constructor check it.
 - **The constructor sees the relayer's transaction, not yours.** If a constructor reads the
   transaction's account, signature or nonce, it gets the relayer's. A class that takes its owner
   from the transaction makes the relayer the owner. Put the owner in the calldata instead.
@@ -146,11 +202,18 @@ class.
   deployments also reads these. The event's `deployer` field is the Private Deployer. That means
   the deployment went through the Private Deployer. It does not prove the deployment was paid from
   the pool, because anyone can call the Private Deployer directly. The transaction shows which it
-  was.
-- **Same reading of the flag.** Any `not_from_zero` value other than 0 counts as true.
+  was. A constructor in a list can deploy contracts of its own, through the UDC or the Private
+  Deployer, so match the events to a list by their addresses, not by counting them.
 
 ## How it differs from the UDC
 
+- **The flag must be 0 or 1.** The UDC reads any felt other than 0 as true. Then one deployment
+  has many encodings, which all deploy to the same address and give the same UDC event. The felts
+  of the pool's invoke are public, so a dApp that built the list could put a felt of its choosing
+  in the flag and use it to tie separate actions together, while a wallet that shows the decoded
+  list would show nothing different. So the Private Deployer refuses any flag but 0 and 1 in a
+  list. The address is the same as the UDC's either way. `deployment_address` still reads any
+  felt other than 0 as true, as the UDC does.
 - **`not_from_zero` does not give you an address of your own.** The UDC mixes its caller into the
   salt, so each caller gets its own addresses. Here the UDC's caller is always the Private
   Deployer, so the address is the same for every sender. An address that only one sender could
@@ -162,6 +225,9 @@ class.
 - **Deployment and a follow-up call can't share a transaction.** With the UDC, an account can
   deploy a contract and call it in the same transaction. Here the deployment is the action's only
   invoke.
+- **One call deploys a list.** The UDC deploys one contract per call, and an account deploys several
+  by calling it several times in one transaction. The pool allows one invoke per action, so the
+  Private Deployer takes the list itself.
 - **It does not declare classes.** Declaring a class is a separate transaction, and it is public.
 
 If another contract runs the Private Deployer's class as its own code with `library_call`, it
@@ -188,8 +254,8 @@ Deployer can revert for reasons that are not the sender's fault:
 - the constructor failed.
 
 The constructor is code from the class, and it runs on calldata the sender chose. That calldata can
-name other contracts for the constructor to call. So trusting the Private Deployer as an invoke
-target means trusting every class and every calldata.
+name other contracts for the constructor to call. A list runs one constructor for each deployment.
+So trusting the Private Deployer as an invoke target means trusting every class and every calldata.
 
 If your relayer keeps a list of trusted targets, don't add the Private Deployer's address to it.
 Decide by the class being deployed and by what its constructor does with its calldata.
@@ -201,7 +267,7 @@ depends on OpenZeppelin's `openzeppelin_utils` and `openzeppelin_interfaces` 2.1
 
 ```bash
 scarb build
-snforge test                                        # 25 tests
+snforge test                                        # 40 tests
 snforge test test_properties --fuzzer-runs 20000    # run the property tests for longer
 snforge test --ignored                              # the fork test, which needs a Sepolia node
 python3 scripts/check-vectors.py                    # check that the two vector files match
@@ -214,28 +280,35 @@ What each test file covers:
 
 - **`tests/test_deployer.cairo`** tests each behaviour described above. It also covers the edge
   cases: salts at both ends of the range, the longest calldata, and an address that was deployed
-  first in four different ways (through the UDC, by another contract from zero, by a direct call
-  to the Private Deployer, and by the class's own constructor calling back). One test replaces the
-  UDC with a contract that deploys to a different address. Other tests send the calldata as raw
-  felts, the way the pool does, with extra felts at the end, with `expected` missing, and with a
-  flag that is neither 0 nor 1.
+  first in several different ways: through the UDC, by another contract from zero, by a direct
+  call to the Private Deployer, by the class's own constructor calling back, and by the
+  constructor of an earlier deployment in the same list (through the UDC, through the Private
+  Deployer, or with its own deploy syscall). One test replaces the UDC with a contract that
+  deploys to a different address. For lists, the tests cover the order of the deployments, an
+  empty list, the same deployment twice, and a wrong or taken address at each place in a list of
+  three, refused before any constructor runs. Other tests send the calldata as raw felts, the way
+  the pool does: with extra felts at the end, with `expected` missing or out of range, with a flag
+  that is neither 0 nor 1 (refused), with a calldata length that runs into the next deployment, with no
+  felts at all, with the one-per-call layout, and with a count of deployments that is zero, too
+  long, too short or huge.
 - **`tests/test_properties.cairo`** has three property tests that run on random salts, flags and
   calldata, 256 rounds each by default:
-  - The address the contract computes is where the UDC actually deploys, and a second call for the
-    same address is refused.
+  - In a list of one to three deployments, the address the contract computes is where the UDC
+    actually deploys, in the order of the list, and a second call with the same list is refused.
   - The address function agrees with the UDC when the UDC is called directly by any caller.
-  - If one argument is changed slightly after the address was computed, the call is refused.
+  - If one argument of one deployment is changed slightly after the address was computed, the call
+    is refused, wherever that deployment is in a list of three.
 - **`tests/test_vectors.cairo`** checks the address function against two files of known answers,
   described under "Vectors" and "Differential fuzz" below.
-- **`tests/test_fork.cairo`** deploys through the real UDC on a fork of Sepolia. The other tests
-  use OpenZeppelin's UDC source (`openzeppelin_presets` 3.0.0) placed at the UDC's address. That is
-  the same code as the real UDC, but not the same compiled class. The fork's node is set in
-  `Scarb.toml` under `SEPOLIA`.
+- **`tests/test_fork.cairo`** deploys through the real UDC on a fork of Sepolia, one deployment at
+  a time and then a list of two. The other tests use OpenZeppelin's UDC source
+  (`openzeppelin_presets` 3.0.0) placed at the UDC's address. That is the same code as the real UDC,
+  but not the same compiled class. The fork's node is set in `Scarb.toml` under `SEPOLIA`.
 
 One limit of the test runner affects some tests. When a call fails, the runner keeps the state
 changes that call made. On chain they are reverted. So when a refusal happens after a deployment
-(a constructor that fails, or a UDC that deploys elsewhere), the test checks the refusal and does
-not check the address afterwards.
+(a constructor that fails, a UDC that deploys elsewhere, or a later deployment in a list), the test
+checks the refusal and does not check the addresses deployed before it.
 
 ### Vectors
 
@@ -253,9 +326,10 @@ There are two kinds of vector:
   longer be asked about it, and the script keeps the answer it already has.
 - **`computed`** vectors come from starknet.js 10.8.0 only.
 
-If your wallet stores the flag as a felt, read it the way the contract does: every value except 0
-is true. In JavaScript the string `"0x0"` is truthy, but as a flag it means false. The `flagged`
-function in `scripts/lib.mjs` shows the correct reading.
+The vectors are about addresses, so they read the flag the way the UDC does: every value except 0
+is true. If your wallet stores the flag as a felt, read it that way when you compute an address. In
+JavaScript the string `"0x0"` is truthy, but as a flag it means false. The `flagged` function in
+`scripts/lib.mjs` shows the correct reading. A list sent to `privacy_invoke` must still use 0 or 1.
 
 `scripts/vectors.mjs` writes `addresses.json` and `addresses.txt`. The Cairo test reads the `.txt`
 file. `scripts/check-vectors.py` checks that the two files match, and CI runs it.
@@ -308,11 +382,38 @@ class from zero.
 
 | Network | Address | Class |
 |---|---|---|
-| Sepolia | `0x05a3ab08e7bae6bf9c0e7cd72ff90e796ae022b505dec4ed1fb5d1b5c802914e` | `0x02b96c23a1fe79e18ce2569f2510d700246d04bf3942c4aa03d1bc61ae4a3dd0` |
+| Sepolia | `0x06285f8870020cf76d8894a824649eac5aba44928a2980bb2cda082a01d2fb6a` | `0x043db241e3aa4982515bdb27d62ed0bc435fdcbe77c2d7dee2e9cd2f421e6935` |
 
 It is not deployed on mainnet yet.
 
-### Sepolia, 2026-11-20
+### Sepolia, 2026-11-24
+
+Deployed with `deploy.sh` and sncast 0.64.0:
+
+- Declared in `0x0036cf64544cf88702fb48b1961bc961188e05a352be1380a56527d277a576e2`.
+- Deployed in `0x05f1100e2883dc9b03399c757719823b99fc77737e9891325e7f535136aba725`.
+- The script's read-back passed.
+
+The same day, one private action deployed a list of two Outis accounts through Sepolia's pool, in
+transaction `0x0793ce26548ecf000a2be7738d6ff9e57ce7dc5e5477a4773f267d783184c4ca`. As in the first
+test below, a local prover proved it and the sending account submitted it itself, so the sender was
+not hidden.
+
+- The action made two withdrawals of 0.01 STRK, one to each account's address, and one invoke of
+  the Private Deployer with the list of both.
+- The pool took its fee of 2 STRK once for the whole action.
+- The UDC emitted two events, in the list's order. Each names the Private Deployer as the deployer.
+- Both accounts were at nonce 0 and held their 0.01 STRK.
+- The same action, proven a second time, was refused with `deployer/already-deployed` when its fee
+  was estimated. Nothing was sent.
+
+### Sepolia, 2026-11-20: the first version
+
+The first version took one deployment per call:
+`privacy_invoke(class_hash, salt, not_from_zero, calldata, expected)`. It is at
+`0x05a3ab08e7bae6bf9c0e7cd72ff90e796ae022b505dec4ed1fb5d1b5c802914e`, class
+`0x02b96c23a1fe79e18ce2569f2510d700246d04bf3942c4aa03d1bc61ae4a3dd0`. It stays there, since nothing
+can remove it, but the list version replaces it.
 
 Deployed with `deploy.sh` and sncast 0.64.0:
 

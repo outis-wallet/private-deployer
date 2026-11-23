@@ -155,9 +155,10 @@ pub mod Reenters {
     fn constructor(ref self: ContractState, deployer: ContractAddress, salt: felt252, not_from_zero: felt252) {
         let this = get_contract_address();
         let class_hash = get_class_hash_at_syscall(this).unwrap_syscall();
-        // The arguments of privacy_invoke(class_hash, salt, not_from_zero, calldata, expected). The
-        // calldata is this constructor's own calldata.
-        let again = array![class_hash.into(), salt, not_from_zero, 3, deployer.into(), salt, not_from_zero, this.into()];
+        // The arguments of privacy_invoke: a list of one deployment, with the fields class_hash,
+        // salt, not_from_zero, calldata and expected. The calldata is this constructor's own
+        // calldata.
+        let again = array![1, class_hash.into(), salt, not_from_zero, 3, deployer.into(), salt, not_from_zero, this.into()];
         self.refused.write(call_contract_syscall(deployer, selector!("privacy_invoke"), again.span()).is_err());
     }
 
@@ -180,7 +181,7 @@ pub trait IBorrower<T> {
 /// A contract that runs the Private Deployer's class as its own code, with `library_call`.
 #[starknet::contract]
 pub mod Borrower {
-    use private_deployer::interfaces::{IPrivateDeployerDispatcherTrait, IPrivateDeployerLibraryDispatcher};
+    use private_deployer::interfaces::{Deployment, IPrivateDeployerDispatcherTrait, IPrivateDeployerLibraryDispatcher};
     use starknet::{ClassHash, ContractAddress};
 
     #[storage]
@@ -197,13 +198,91 @@ pub mod Borrower {
             calldata: Span<felt252>,
             expected: ContractAddress,
         ) {
-            IPrivateDeployerLibraryDispatcher { class_hash: deployer_class }.privacy_invoke(class_hash, salt, not_from_zero, calldata, expected);
+            let deployments = array![Deployment { class_hash, salt, not_from_zero, calldata, expected }];
+            IPrivateDeployerLibraryDispatcher { class_hash: deployer_class }.privacy_invoke(deployments.span());
         }
 
         fn address(
             self: @ContractState, deployer_class: ClassHash, class_hash: ClassHash, salt: felt252, not_from_zero: bool, calldata: Span<felt252>,
         ) -> ContractAddress {
             IPrivateDeployerLibraryDispatcher { class_hash: deployer_class }.deployment_address(class_hash, salt, not_from_zero, calldata)
+        }
+    }
+}
+
+/// A class whose constructor deploys another contract from zero through the UDC, with the class,
+/// salt and calldata it is given. A test puts it in a list before that other contract, so that the
+/// address is already taken when the Private Deployer gets to it.
+#[starknet::contract]
+pub mod Squatter {
+    use openzeppelin_interfaces::deployments::{IUniversalDeployerDispatcher, IUniversalDeployerDispatcherTrait};
+    use private_deployer::address::UNIVERSAL_DEPLOYER;
+    use starknet::ClassHash;
+
+    #[storage]
+    struct Storage {}
+
+    #[constructor]
+    // The parameters aren't named `class_hash` or `calldata`, which snforge's generated deployment
+    // helper already uses.
+    fn constructor(ref self: ContractState, of_class: ClassHash, salt: felt252, args: Span<felt252>) {
+        IUniversalDeployerDispatcher { contract_address: UNIVERSAL_DEPLOYER }.deploy_contract(of_class, salt, false, args);
+    }
+}
+
+/// A class whose constructor calls the Private Deployer with the raw calldata it is given, and
+/// fails if that call fails.
+#[starknet::contract]
+pub mod ReentersWith {
+    use starknet::syscalls::call_contract_syscall;
+    use starknet::{ContractAddress, SyscallResultTrait};
+
+    #[storage]
+    struct Storage {}
+
+    #[constructor]
+    fn constructor(ref self: ContractState, deployer: ContractAddress, raw: Span<felt252>) {
+        call_contract_syscall(deployer, selector!("privacy_invoke"), raw).unwrap_syscall();
+    }
+}
+
+/// A class whose constructor deploys another contract from zero itself, with `deploy_syscall`, so
+/// that it, and not the UDC, is that contract's constructor's caller.
+#[starknet::contract]
+pub mod DeploysItself {
+    use starknet::syscalls::deploy_syscall;
+    use starknet::{ClassHash, SyscallResultTrait};
+
+    #[storage]
+    struct Storage {}
+
+    #[constructor]
+    fn constructor(ref self: ContractState, of_class: ClassHash, salt: felt252, args: Span<felt252>) {
+        deploy_syscall(of_class, salt, args, true).unwrap_syscall();
+    }
+}
+
+/// A fake UDC that deploys where the real one does, but answers a different address when the salt
+/// is 2. A test places it at the UDC's address to check that the answer is checked for every
+/// deployment in a list, not only the first.
+#[starknet::contract]
+pub mod ElsewhereSecond {
+    use openzeppelin_interfaces::deployments::IUniversalDeployer;
+    use starknet::syscalls::deploy_syscall;
+    use starknet::{ClassHash, ContractAddress, SyscallResultTrait};
+
+    #[storage]
+    struct Storage {}
+
+    #[abi(embed_v0)]
+    impl ElsewhereSecondImpl of IUniversalDeployer<ContractState> {
+        fn deploy_contract(ref self: ContractState, class_hash: ClassHash, salt: felt252, not_from_zero: bool, calldata: Span<felt252>) -> ContractAddress {
+            let (address, _) = deploy_syscall(class_hash, salt, calldata, !not_from_zero).unwrap_syscall();
+            if salt == 2 {
+                1.try_into().unwrap()
+            } else {
+                address
+            }
         }
     }
 }

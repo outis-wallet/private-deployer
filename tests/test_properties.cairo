@@ -1,7 +1,7 @@
 use openzeppelin_interfaces::deployments::{IUniversalDeployerDispatcher, IUniversalDeployerDispatcherTrait};
 use private_deployer::address::{UNIVERSAL_DEPLOYER, deployment_address};
 use private_deployer::deployer::PrivateDeployer::errors;
-use private_deployer::interfaces::{IPrivateDeployerDispatcherTrait, IPrivateDeployerSafeDispatcher, IPrivateDeployerSafeDispatcherTrait};
+use private_deployer::interfaces::{Deployment, IPrivateDeployerDispatcherTrait, IPrivateDeployerSafeDispatcher, IPrivateDeployerSafeDispatcherTrait};
 use snforge_std::{get_class_hash, spy_events, start_cheat_caller_address, stop_cheat_caller_address};
 use starknet::ContractAddress;
 use crate::mocks::{ITargetDispatcher, ITargetDispatcherTrait};
@@ -14,11 +14,11 @@ fn shape(shape: u8, a: felt252, b: felt252, c: felt252) -> (bool, Array<felt252>
 }
 
 /// The Private Deployer and the UDC both compute the address from the same arguments. This test
-/// checks that they agree for any salt, flag and calldata.
+/// checks that they agree for any salt, flag and calldata, in a list of one to three deployments.
 ///
-/// The contract must end up at the address `deployment_address` returned. The test confirms this
-/// from the UDC's event and from the class that is at the address afterwards. It also checks that
-/// a second call for the same address is refused.
+/// Each contract must end up at the address `deployment_address` returned. The test confirms this
+/// from the UDC's events, which must come in the order of the list, and from the class that is at
+/// each address afterwards. It also checks that a second call with the same list is refused.
 ///
 /// It runs 256 rounds with the suite. For more, run
 /// `snforge test test_properties --fuzzer-runs 20000`.
@@ -30,27 +30,41 @@ fn deploys_where_it_says(salt: felt252, value: felt252, shape_of: u8, a: felt252
     let target = class("Target");
     let (not_from_zero, extra) = shape(shape_of, a, b, c);
     let calldata = target_calldata(value, extra.span());
-    let expected = deployer.deployment_address(target, salt, not_from_zero, calldata.span());
-    assert_eq!(get_class_hash(expected), 0.try_into().unwrap());
+    // One to three deployments of the same calldata, at consecutive salts and alternating flags.
+    let count: u32 = ((shape_of / 8) % 3 + 1).into();
+    let mut list = array![];
+    let mut addresses = array![];
+    for at in 0..count {
+        let salt = salt + at.into();
+        let not_from_zero = not_from_zero ^ (at % 2 == 1);
+        let expected = deployer.deployment_address(target, salt, not_from_zero, calldata.span());
+        assert_eq!(get_class_hash(expected), 0.try_into().unwrap());
+        list.append(Deployment { class_hash: target, salt, not_from_zero, calldata: calldata.span(), expected });
+        addresses.append(expected.into());
+    }
 
     let mut spy = spy_events();
-    let deposits = deployer.privacy_invoke(target, salt, not_from_zero, calldata.span(), expected);
+    let deposits = deployer.privacy_invoke(list.span());
 
     assert_eq!(deposits.len(), 0);
-    assert_eq!(announced(ref spy), array![expected.into()]);
-    assert_eq!(get_class_hash(expected), target);
-    let deployed = ITargetDispatcher { contract_address: expected };
-    assert_eq!(deployed.value(), value);
-    assert_eq!(deployed.extra(), core::poseidon::poseidon_hash_span(extra.span()));
-    assert_eq!(deployed.constructed_by(), UNIVERSAL_DEPLOYER);
+    assert_eq!(announced(ref spy), addresses);
+    for deployment in list.span() {
+        let expected = *deployment.expected;
+        assert_eq!(get_class_hash(expected), target);
+        let deployed = ITargetDispatcher { contract_address: expected };
+        assert_eq!(deployed.value(), value);
+        assert_eq!(deployed.extra(), core::poseidon::poseidon_hash_span(extra.span()));
+        assert_eq!(deployed.constructed_by(), UNIVERSAL_DEPLOYER);
+    }
 
-    // A second call with the same arguments must be refused, and nothing more is deployed.
+    // A second call with the same list must be refused, and nothing more is deployed. The spy
+    // still holds the first call's events, so the count stays where it was.
     let safe = IPrivateDeployerSafeDispatcher { contract_address: deployer.contract_address };
-    match safe.privacy_invoke(target, salt, not_from_zero, calldata.span(), expected) {
+    match safe.privacy_invoke(list.span()) {
         Result::Ok(_) => panic!("not refused"),
         Result::Err(data) => assert_eq!(*data.at(0), errors::ALREADY_DEPLOYED),
     }
-    assert_eq!(announced(ref spy).len(), 1);
+    assert_eq!(announced(ref spy).len(), count);
 }
 
 /// Checks the address function against the UDC when any caller calls the UDC directly. The address
@@ -99,16 +113,34 @@ fn flipped(value: felt252, bit: u8) -> felt252 {
 /// the address, then changes one argument slightly and makes the call.
 ///
 /// The change is one flipped bit in the class hash, the salt, a calldata felt or the address
-/// itself, or the opposite flag, or one extra calldata felt. The call must fail with the
-/// unexpected-address error, and nothing may be deployed.
+/// itself, or the opposite flag, or one extra calldata felt. The changed deployment is at a fuzzed
+/// place in a list of three. The call must fail with the unexpected-address error.
+///
+/// When the changed deployment comes first, nothing may be deployed. When it comes later, the
+/// deployments before it ran, and on chain the failure reverts them. The test runner keeps them,
+/// so the test only checks that the changed deployment's address is still empty.
 #[test]
 #[fuzzer]
 #[feature("safe_dispatcher")]
-fn refuses_an_argument_changed_after_the_address(salt: felt252, value: felt252, shape_of: u8, a: felt252, b: felt252, c: felt252, change: u8, bit: u8) {
+fn refuses_an_argument_changed_after_the_address(
+    salt: felt252, value: felt252, shape_of: u8, a: felt252, b: felt252, c: felt252, change: u8, bit: u8, place: u8,
+) {
     let deployer = setup();
     let target = class("Target");
     let (not_from_zero, extra) = shape(shape_of, a, b, c);
     let calldata = target_calldata(value, extra.span());
+    let place: u32 = (place % 3).into();
+    // The unchanged deployments use salts of their own, after the changed one's.
+    let other = |at: u32| -> Deployment {
+        let salt = salt + 1 + at.into();
+        Deployment {
+            class_hash: target,
+            salt,
+            not_from_zero,
+            calldata: calldata.span(),
+            expected: deployer.deployment_address(target, salt, not_from_zero, calldata.span()),
+        }
+    };
     let expected = deployer.deployment_address(target, salt, not_from_zero, calldata.span());
 
     let mut class_hash = target;
@@ -126,12 +158,24 @@ fn refuses_an_argument_changed_after_the_address(salt: felt252, value: felt252, 
         _ => address = flipped(expected.into(), bit).try_into().unwrap(),
     }
 
+    let changed = Deployment { class_hash, salt: changed_salt, not_from_zero: flag, calldata: changed_calldata.span(), expected: address };
+    let mut list = array![];
+    for at in 0..3_u32 {
+        list.append(if at == place {
+            changed
+        } else {
+            other(at)
+        });
+    }
+
     let mut spy = spy_events();
     let safe = IPrivateDeployerSafeDispatcher { contract_address: deployer.contract_address };
-    match safe.privacy_invoke(class_hash, changed_salt, flag, changed_calldata.span(), address) {
+    match safe.privacy_invoke(list.span()) {
         Result::Ok(_) => panic!("not refused"),
         Result::Err(data) => assert_eq!(*data.at(0), errors::UNEXPECTED_ADDRESS),
     }
-    assert_eq!(announced(ref spy).len(), 0);
+    if place == 0 {
+        assert_eq!(announced(ref spy).len(), 0);
+    }
     assert_eq!(get_class_hash(expected), 0.try_into().unwrap());
 }
